@@ -82,6 +82,12 @@ XL2TPD_CONF="/etc/xl2tpd/xl2tpd.conf"
 PPP_FILE="/etc/ppp/options.l2tp-connect-tool"
 CONTROL_FILE="/var/run/xl2tpd/l2tp-control"
 CONNECTION_NAME="auto-vpn-connect"
+INTERFACE="ppp0"
+
+# True when $INTERFACE has an IPv4 address (tunnel considered up).
+interface_has_vpn_ip() {
+    ip -4 addr show dev "$INTERFACE" 2>/dev/null | grep -q "inet "
+}
 
 info "Configuring VPN settings..."
 
@@ -150,10 +156,14 @@ password "$PASSWORD"
 EOF
 
 # 5. Apply core configurations and ensure base services are running
-info "Restarting core services to apply configurations..."
-systemctl restart xl2tpd.service
-ipsec restart 2>/dev/null || systemctl restart strongswan-ipsec
-sleep 2
+if interface_has_vpn_ip; then
+    info "$INTERFACE already has an IPv4 address; leaving the existing tunnel up (not restarting xl2tpd or IPsec)."
+else
+    info "Restarting core services to apply configurations..."
+    systemctl restart xl2tpd.service
+    ipsec restart 2>/dev/null || systemctl restart strongswan-ipsec
+    sleep 2
+fi
 
 # ==========================================
 # BACKGROUND KEEPALIVE MODE (Systemd Daemon)
@@ -167,6 +177,15 @@ if [ "$KEEPALIVE" = true ]; then
     # Create the keepalive script (${CONNECTION_NAME} expanded here; \$ escapes inner-script vars)
     cat > "$KEEPALIVE_SCRIPT" <<KEOF
 #!/bin/bash
+# If ppp0 already has an IP, do not tear down the tunnel; just monitor.
+if ip -4 addr show dev ppp0 2>/dev/null | grep -q "inet "; then
+    while ip -4 addr show dev ppp0 2>/dev/null | grep -q "inet "; do
+        sleep 15
+    done
+    echo "VPN interface lost. Exiting for restart..."
+    exit 1
+fi
+
 # 1. Clean up any stale sessions
 ipsec down ${CONNECTION_NAME} 2>/dev/null
 sleep 2
@@ -180,7 +199,7 @@ echo "c ${CONNECTION_NAME}" > /var/run/xl2tpd/l2tp-control
 MAX_RETRIES=10
 COUNT=0
 while [ \$COUNT -lt \$MAX_RETRIES ]; do
-    if ip addr show ppp0 > /dev/null 2>&1; then
+    if ip -4 addr show dev ppp0 2>/dev/null | grep -q "inet "; then
         echo "VPN connected successfully."
         break
     fi
@@ -189,7 +208,7 @@ while [ \$COUNT -lt \$MAX_RETRIES ]; do
 done
 
 # 4. The Stay Alive Loop
-while ip addr show ppp0 > /dev/null 2>&1; do
+while ip -4 addr show dev ppp0 2>/dev/null | grep -q "inet "; do
     sleep 15
 done
 
@@ -247,45 +266,49 @@ cleanup() {
 # Trap Ctrl+C (SIGINT) and termination signals to run cleanup
 trap cleanup SIGINT SIGTERM
 
-info "Initializing IPsec (Phase 1)..."
-ipsec down "$CONNECTION_NAME" 2>/dev/null
-sleep 1
-ipsec up "$CONNECTION_NAME"
-sleep 2
-
-info "Initializing L2TP/PPP (Phase 2)..."
-if [ -p "$CONTROL_FILE" ]; then
-    echo "c $CONNECTION_NAME" > "$CONTROL_FILE"
+if interface_has_vpn_ip; then
+    ASSIGNED_IP=$(ip -4 addr show dev "$INTERFACE" | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+    info "VPN already active on $INTERFACE (IP: $ASSIGNED_IP). Press Ctrl+C to disconnect gracefully."
 else
-    error "Control file $CONTROL_FILE does not exist. Is xl2tpd running?"
-    cleanup
-fi
+    info "Initializing IPsec (Phase 1)..."
+    ipsec down "$CONNECTION_NAME" 2>/dev/null
+    sleep 1
+    ipsec up "$CONNECTION_NAME"
+    sleep 2
 
-# Wait Loop for IP address assignment
-INTERFACE="ppp0"
-
-COUNT=0
-
-info "Waiting for IP assignment on $INTERFACE..."
-while [ $COUNT -lt $MAX_RETRIES ]; do
-    if ip -4 addr show dev "$INTERFACE" 2>/dev/null | grep -q "inet "; then
-        ASSIGNED_IP=$(ip -4 addr show dev "$INTERFACE" | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
-        info "Success: VPN connected! IP assigned is $ASSIGNED_IP"
-        ip link set dev "$INTERFACE" up
-        break
+    info "Initializing L2TP/PPP (Phase 2)..."
+    if [ -p "$CONTROL_FILE" ]; then
+        echo "c $CONNECTION_NAME" > "$CONTROL_FILE"
+    else
+        error "Control file $CONTROL_FILE does not exist. Is xl2tpd running?"
+        cleanup
     fi
-    warning "Retrying for IP assignment on $INTERFACE... ($COUNT/$MAX_RETRIES)"
-    sleep "$IP_RETRY_SLEEP"
-    ((COUNT++))
-done
 
-if [ $COUNT -eq $MAX_RETRIES ]; then
-    error "VPN failed to establish the $INTERFACE interface or receive an IP."
-    cleanup
+    # Wait Loop for IP address assignment
+    COUNT=0
+
+    info "Waiting for IP assignment on $INTERFACE..."
+    while [ $COUNT -lt $MAX_RETRIES ]; do
+        if ip -4 addr show dev "$INTERFACE" 2>/dev/null | grep -q "inet "; then
+            ASSIGNED_IP=$(ip -4 addr show dev "$INTERFACE" | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+            info "Success: VPN connected! IP assigned is $ASSIGNED_IP"
+            ip link set dev "$INTERFACE" up
+            break
+        fi
+        warning "Retrying for IP assignment on $INTERFACE... ($COUNT/$MAX_RETRIES)"
+        sleep "$IP_RETRY_SLEEP"
+        ((COUNT++))
+    done
+
+    if [ $COUNT -eq $MAX_RETRIES ]; then
+        error "VPN failed to establish the $INTERFACE interface or receive an IP."
+        cleanup
+    fi
+
+    info "VPN is active. Press Ctrl+C to disconnect gracefully."
 fi
 
 # The Stay Alive Loop
-info "VPN is active. Press Ctrl+C to disconnect gracefully."
 while ip -4 addr show dev "$INTERFACE" 2>/dev/null | grep -q "inet "; do
     sleep 5
 done
