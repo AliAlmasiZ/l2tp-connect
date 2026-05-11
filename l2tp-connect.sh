@@ -196,15 +196,28 @@ sleep 2
 echo "c ${CONNECTION_NAME}" > /var/run/xl2tpd/l2tp-control
 
 # 3. Wait for the interface to appear (e.g., ppp0)
-MAX_RETRIES=10
+MAX_RETRIES=$MAX_RETRIES
 COUNT=0
 while [ \$COUNT -lt \$MAX_RETRIES ]; do
     if ip -4 addr show dev ppp0 2>/dev/null | grep -q "inet "; then
         echo "VPN connected successfully."
         break
     fi
+    systemctl restart xl2tpd
+    
+    # 2. Wait for the daemon to fully initialize
     sleep 2
-    \$((COUNT++))
+    
+    # 3. Trigger the connection
+    if [ -p "$CONTROL_FILE" ]; then
+        echo "c $CONNECTION_NAME" > "$CONTROL_FILE"
+    else
+        exit 1
+    fi
+
+    sleep "$IP_RETRY_SLEEP"
+
+    ((COUNT++))
 done
 
 # 4. The Stay Alive Loop
@@ -272,6 +285,7 @@ if interface_has_vpn_ip; then
 else
     info "Initializing IPsec (Phase 1)..."
     ipsec down "$CONNECTION_NAME" 2>/dev/null
+    systemctl restart strongswan-starter
     sleep 1
     ipsec up "$CONNECTION_NAME"
     sleep 2
@@ -296,8 +310,23 @@ else
             break
         fi
         warning "Retrying for IP assignment on $INTERFACE... ($COUNT/$MAX_RETRIES)"
+
+        # 1. Clean up dead states
+        systemctl restart xl2tpd
+        
+        # 2. Wait for the daemon to fully initialize
+        sleep 2
+        
+        # 3. Trigger the connection
+        if [ -p "$CONTROL_FILE" ]; then
+            echo "c $CONNECTION_NAME" > "$CONTROL_FILE"
+        else
+            error "Error occured: $CONTROL_FILE doesn't exist"
+        fi
+
         sleep "$IP_RETRY_SLEEP"
         ((COUNT++))
+
     done
 
     if [ $COUNT -eq $MAX_RETRIES ]; then
